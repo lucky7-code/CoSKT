@@ -22,6 +22,9 @@ class CoSKT(nn.Module):
                                      nn.SELU(inplace=True), nn.Linear(hidden_dim, 110, bias=False), nn.BatchNorm1d(110))
         self.register_buffer("temperature", torch.tensor(0.4))
         self.register_buffer("negatives_mask", (~torch.eye(batch_size * 49 * 2, batch_size * 49 * 2, dtype=bool)).float())
+        self.multi_head = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=8)
+        self.g = nn.Linear(2*hidden_dim, hidden_dim)
+        self.W_o = nn.Linear(2*hidden_dim, hidden_dim)
     def forward(self, data):
         me = data[0].squeeze(-1)  # [B, L, 3]
         Q = self.emb_q(me[:, :, 0])
@@ -53,10 +56,27 @@ class CoSKT(nn.Module):
         score = self.softmax(intra_out.unsqueeze(2).matmul(inter_out.transpose(-2, -1))/math.sqrt(80))
         inter_out = score.matmul(inter_out).squeeze(2)
         r_ans = score.matmul(r_ans).squeeze(2)
+        # inter_out, r_ans = self.multi_head_attention(inter_out,intra_out, r_ans)
         r_ans = self.w(r_ans)
         loss = self.c_loss(intra_out.contiguous().view(-1, self.hidden_dim), inter_out1.contiguous().view(-1, self.hidden_dim), self.bs*49)
         logits_pre = self.sig(self.fc(intra_out + inter_out + r_ans))
         return logits_pre , loss
+
+    def gate_fusion(self, a, b, c):
+        g = self.sig(self.g(torch.cat([a, b],-1)))
+        s = g * a + (1 - g) * c
+        z = self.W_o(torch.cat([s, c],-1))
+        return z
+
+    def multi_head_attention(self, inter_out,intra_out, r_ans):
+        inter_out_x = torch.flatten(inter_out,0,1).transpose(0,1)/math.sqrt(80)
+        intra_out_x = torch.flatten(intra_out,0,1)
+        r_ans = torch.flatten(r_ans,0, 1).transpose(0,1)/math.sqrt(80)
+        inter_out, _ = self.multi_head(intra_out_x.unsqueeze(0), inter_out_x, inter_out_x)
+        r_ans,_ = self.multi_head(intra_out_x.unsqueeze(0), inter_out_x,r_ans)
+        inter_out = inter_out.squeeze(0).view(-1, 49, 80)
+        r_ans = r_ans.squeeze(0).view(-1, 49, 80)
+        return inter_out, r_ans
 
     def c_loss(self, emb_i, emb_j, batch_size):
         """
